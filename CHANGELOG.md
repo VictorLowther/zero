@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once the first release is
 tagged. Until then, source builds report the version `dev`.
 
+## [0.13.0](https://github.com/Twigpine/zero/compare/v0.12.0...v0.13.0) (2026-11-05)
+
+
+### Features
+
+* **mcp:** add AI/ML API as an opt-in built-in server ([#1193](https://github.com/Twigpine/zero/issues/1193)) ([16ccd78](https://github.com/Twigpine/zero/commit/16ccd78765b6a2a56b7370e3031710d718aa4757))
+* **web-fetch:** add an opt-in AI/ML API Toolbox scraping backend ([#1192](https://github.com/Twigpine/zero/issues/1192)) ([c9f1794](https://github.com/Twigpine/zero/commit/c9f179482a7f6d7111ee64fa9cb8ffa2517c2397))
+* **web-search:** add AI/ML API Toolbox as an opt-in backend ([#1189](https://github.com/Twigpine/zero/issues/1189)) ([9873645](https://github.com/Twigpine/zero/commit/98736457bdac6b0272e032728a5485cf557780fe))
+
 ## [0.12.0](https://github.com/Twigpine/zero/compare/v0.11.0...v0.12.0) (2026-11-02)
 
 
