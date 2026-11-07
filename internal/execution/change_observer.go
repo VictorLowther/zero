@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"io"
 	"io/fs"
@@ -9,12 +10,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
 	maxObservedFiles    = 20_000
 	maxHashedFileBytes  = 1 << 20
 	maxTotalHashedBytes = 32 << 20
+	maxHashCacheEntries = 32_000
 )
 
 type ChangeKind string
@@ -42,6 +46,90 @@ type fileFingerprint struct {
 	// observer never enumerates that tree into individual changes.
 	Aggregated bool
 	Count      int
+}
+
+// hashCacheKey identifies file content by path plus the stat fields we treat
+// as change signals. A file rewritten with identical size and mtime within the
+// cache window can be missed; the mtime+size tuple is the same heuristic
+// editors, make, and watchexec rely on.
+type hashCacheKey struct {
+	Path    string
+	Size    int64
+	ModTime int64
+}
+
+type hashCacheEntry struct {
+	key     hashCacheKey
+	digest  [sha256.Size]byte
+	expiry  time.Time
+	element *list.Element
+}
+
+// hashCache memoises SHA-256 digests across observer snapshots. Change
+// observers run before and after every command, and most workspaces are
+// unchanged between runs, so re-hashing every file each time dominates CPU.
+// The cache is LRU with a TTL; it is only an optimisation, so any miss or
+// eviction is safe.
+type hashCache struct {
+	mu       sync.Mutex
+	entries  map[hashCacheKey]*hashCacheEntry
+	order    *list.List
+	capacity int
+	ttl      time.Duration
+	now      func() time.Time
+}
+
+var observedHashCache = newHashCache(maxHashCacheEntries, 10*time.Minute)
+
+func newHashCache(capacity int, ttl time.Duration) *hashCache {
+	return &hashCache{
+		entries:  make(map[hashCacheKey]*hashCacheEntry, capacity),
+		order:    list.New(),
+		capacity: capacity,
+		ttl:      ttl,
+		now:      time.Now,
+	}
+}
+
+func (cache *hashCache) get(key hashCacheKey) ([sha256.Size]byte, bool) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	entry, ok := cache.entries[key]
+	if !ok {
+		return [sha256.Size]byte{}, false
+	}
+	if !cache.now().Before(entry.expiry) {
+		cache.remove(entry)
+		return [sha256.Size]byte{}, false
+	}
+	cache.order.MoveToFront(entry.element)
+	return entry.digest, true
+}
+
+func (cache *hashCache) put(key hashCacheKey, digest [sha256.Size]byte) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if entry, ok := cache.entries[key]; ok {
+		entry.digest = digest
+		entry.expiry = cache.now().Add(cache.ttl)
+		cache.order.MoveToFront(entry.element)
+		return
+	}
+	entry := &hashCacheEntry{key: key, digest: digest, expiry: cache.now().Add(cache.ttl)}
+	entry.element = cache.order.PushFront(entry)
+	cache.entries[key] = entry
+	for cache.order.Len() > cache.capacity {
+		oldest := cache.order.Back()
+		if oldest == nil {
+			break
+		}
+		cache.remove(oldest.Value.(*hashCacheEntry))
+	}
+}
+
+func (cache *hashCache) remove(entry *hashCacheEntry) {
+	cache.order.Remove(entry.element)
+	delete(cache.entries, entry.key)
 }
 
 // ChangeObserver records a bounded workspace snapshot around a command. It
@@ -128,11 +216,18 @@ func snapshotWorkspace(root string) (map[string]fileFingerprint, bool) {
 			return nil
 		}
 		fingerprint := fileFingerprint{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime().UnixNano()}
-		if info.Size() <= maxHashedFileBytes && hashedBytes+info.Size() <= maxTotalHashedBytes {
-			if digest, err := hashObservedFile(path); err == nil {
+		if info.Size() <= maxHashedFileBytes {
+			key := hashCacheKey{Path: path, Size: info.Size(), ModTime: fingerprint.ModTime}
+			if digest, ok := observedHashCache.get(key); ok {
 				fingerprint.Digest = digest
 				fingerprint.Hashed = true
-				hashedBytes += info.Size()
+			} else if hashedBytes+info.Size() <= maxTotalHashedBytes {
+				if digest, err := hashObservedFile(path); err == nil {
+					fingerprint.Digest = digest
+					fingerprint.Hashed = true
+					hashedBytes += info.Size()
+					observedHashCache.put(key, digest)
+				}
 			}
 		}
 		files[filepath.ToSlash(relative)] = fingerprint
