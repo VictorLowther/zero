@@ -835,15 +835,15 @@ func providerDescriptorByBaseURL(baseURL string) (providercatalog.Descriptor, bo
 	if normalized == "" {
 		return providercatalog.Descriptor{}, false
 	}
-	for _, descriptor := range providercatalog.All() {
+	// Find scans the internal catalog without cloning. This runs on render-adjacent
+	// paths (see modelContextWindow), where the previous All() scan cloned every
+	// descriptor on every call.
+	return providercatalog.Find(func(descriptor providercatalog.Descriptor) bool {
 		if genericProviderCatalogID(descriptor.ID) {
-			continue
+			return false
 		}
-		if normalizeProviderBaseURL(descriptor.DefaultBaseURL) == normalized {
-			return descriptor, true
-		}
-	}
-	return providercatalog.Descriptor{}, false
+		return normalizeProviderBaseURL(descriptor.DefaultBaseURL) == normalized
+	})
 }
 
 func normalizeProviderBaseURL(baseURL string) string {

@@ -66,6 +66,28 @@ Supported environment variables:
 - `ZERO_PERF_FIRST_OUTPUT_WARN_MS`
 - `ZERO_PERF_HARNESS_END_RSS_WARN_MB`
 
+## CPU and Memory Profiling
+
+The `zero` CLI accepts process-wide pprof flags that wrap any run — the
+interactive TUI, `exec`, or a one-shot prompt:
+
+```bash
+zero --cpuprofile cpu.out --memprofile heap.out exec "fix the failing test"
+go tool pprof -http=:8080 cpu.out
+go tool pprof -http=:8080 heap.out
+```
+
+- `--cpuprofile <path>` records a CPU profile for the whole process lifetime.
+- `--memprofile <path>` writes a heap profile when the process exits, so it
+  reflects the working set the run actually accumulated.
+- Both are leading root flags and compose in any order with `--add-dir`,
+  `--theme`, and `--allow-escalation`; a path that cannot be opened fails the
+  run loudly rather than silently skipping collection.
+
+This is the intended way to profile render hot paths (for example the stream
+coalescing in `internal/tui`) against real sessions instead of external
+samplers.
+
 ## CI Behavior
 
 The `Performance Smoke` job builds the binary, runs
