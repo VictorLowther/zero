@@ -319,6 +319,22 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 	}
 	addDirs, theme, allowEscalation := root.addDirs, root.theme, root.allowEscalation
 
+	// Profiling wraps the whole run and is written on the way out. The finish
+	// defer is registered after Recover so LIFO order closes the profile files
+	// before a panic is converted into a crash report and exit code.
+	session, err := startProfilers(root.profiles, stderr)
+	if err != nil {
+		return writeAppError(stderr, err.Error(), 1)
+	}
+	defer func() {
+		if ferr := session.finish(); ferr != nil {
+			_, _ = fmt.Fprintf(stderr, "[zero] %v\n", ferr)
+			if exitCode == exitSuccess {
+				exitCode = 1
+			}
+		}
+	}()
+
 	if len(args) == 0 {
 		return runInteractiveTUI(stderr, deps, agent.PermissionModeAsk, addDirs, theme, allowEscalation)
 	}
@@ -366,6 +382,10 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 		if more.theme != "" {
 			skipTheme = more.theme
 		}
+		skipProfiles := root.profiles
+		if more.profiles.provided {
+			skipProfiles = mergeProfilers(root.profiles, more.profiles)
+		}
 		skipAllowEscalation := more.allowEscalation
 		// A misplaced --add-dir anywhere in the remainder is the more specific error,
 		// so check for it across all of rest before rejecting stray args.
@@ -382,6 +402,12 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 			if strings.TrimSpace(arg) != "" {
 				return writeAppError(stderr, "--skip-permissions-unsafe launches the interactive TUI and takes no prompt or subcommand; for a one-shot unsafe run use `zero exec --skip-permissions-unsafe -p \"...\"`", 1)
 			}
+		}
+		// Root flags may sit on either side of --skip-permissions-unsafe, so the
+		// merged set can name targets the session opened at the root never saw;
+		// point the session at the merged paths before launching.
+		if err := session.reconfigure(skipProfiles); err != nil {
+			return writeAppError(stderr, err.Error(), 1)
 		}
 		return runInteractiveTUI(stderr, deps, agent.PermissionModeUnsafe, append(append([]string{}, addDirs...), moreDirs...), skipTheme, allowEscalation || skipAllowEscalation)
 	case "-h", "--help", "help":
@@ -1393,6 +1419,8 @@ Flags:
   -p, --prompt                   Run a one-shot prompt
       --add-dir <path>           Allow writes in an extra directory (repeatable)
       --allow-escalation         Let the agent escalate to a stronger model mid-run via escalate_model
+      --cpuprofile <path>        Write a CPU profile (pprof format) for the whole run
+      --memprofile <path>        Write a heap profile (pprof format) when the run exits
       --skip-permissions-unsafe  Launch the interactive shell in unsafe mode (enables the ! shell escape)
 `)
 	return err
@@ -1466,10 +1494,11 @@ type rootFlags struct {
 	addDirs         []string
 	theme           string
 	allowEscalation bool
+	profiles        profilers
 }
 
-// splitLeadingRootFlags strips --add-dir, --theme and --allow-escalation from
-// the front of args in whatever order they were written, stopping at the
+// splitLeadingRootFlags strips --add-dir, --theme, --allow-escalation and the
+// profiling flags from the front of args in whatever order they were written, stopping at the
 // first token none of them claims.
 //
 // EACH SPLITTER STOPS AT THE FIRST TOKEN IT DOES NOT OWN, so running them once
@@ -1501,6 +1530,13 @@ func splitLeadingRootFlags(args []string) (rootFlags, []string, error) {
 			return rootFlags{}, nil, err
 		}
 		flags.allowEscalation = flags.allowEscalation || allowEscalation
+		profiles, rest, err := splitLeadingProfileFlags(rest)
+		if err != nil {
+			return rootFlags{}, nil, err
+		}
+		if profiles.provided {
+			flags.profiles = mergeProfilers(flags.profiles, profiles)
+		}
 		args = rest
 		if len(args) == before {
 			return flags, args, nil
