@@ -317,6 +317,124 @@ func TestNonOAuthServerIsUnaffected(t *testing.T) {
 	}
 }
 
+func TestNetworkClientNegotiatesAfterHTTP400VersionRejection(t *testing.T) {
+	// Regression for servers like the GitLab MCP: they reject an initialize
+	// proposal they do not support with HTTP 400 whose JSON-RPC error data
+	// lists the versions they do support. The client must parse that list,
+	// retry with a mutually supported version, and send it in the
+	// MCP-Protocol-Version header on subsequent requests.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var initProposals []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		message := readHTTPRPCMessage(t, r)
+		switch message.Method {
+		case "initialize":
+			var params struct {
+				ProtocolVersion string `json:"protocolVersion"`
+			}
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatalf("decode initialize params: %v", err)
+			}
+			initProposals = append(initProposals, params.ProtocolVersion)
+			if params.ProtocolVersion != "2025-06-18" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				if _, err := w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":{"params":"Unsupported protocol version '` + params.ProtocolVersion + `'. Supported: 2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26"}},"id":1}`)); err != nil {
+					t.Errorf("write rejection: %v", err)
+				}
+				return
+			}
+			writeHTTPRPCResponse(t, w, message.ID, map[string]any{"protocolVersion": "2025-06-18"})
+		case "notifications/initialized":
+			if got := r.Header.Get("MCP-Protocol-Version"); got != "2025-06-18" {
+				t.Errorf("initialized MCP-Protocol-Version = %q, want 2025-06-18", got)
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			if got := r.Header.Get("MCP-Protocol-Version"); got != "2025-06-18" {
+				t.Errorf("tools/list MCP-Protocol-Version = %q, want 2025-06-18", got)
+			}
+			writeHTTPRPCResponse(t, w, message.ID, map[string]any{"tools": []map[string]any{{
+				"name":        "lookup",
+				"inputSchema": map[string]any{"type": "object"},
+			}}})
+		default:
+			writeHTTPRPCResponse(t, w, message.ID, map[string]any{})
+		}
+	}))
+	defer upstream.Close()
+
+	client, err := Connect(ctx, Server{Name: "gitlab", Type: ServerTypeHTTP, URL: upstream.URL})
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	listed, err := client.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+	if len(listed) != 1 || listed[0].Name != "lookup" {
+		t.Fatalf("listed tools = %#v, want lookup", listed)
+	}
+	// The first rejection names 2025-11-25 as supported but newer servers
+	// list 2026-07-28 first, which we do not speak; the client must fall to
+	// the newest mutually supported version.
+	want := []string{handshakeProtocolVersions[0], "2025-06-18"}
+	if len(initProposals) != len(want) {
+		t.Fatalf("initialize proposals = %v, want %v", initProposals, want)
+	}
+	for i := range want {
+		if initProposals[i] != want[i] {
+			t.Fatalf("initialize proposals = %v, want %v", initProposals, want)
+		}
+	}
+}
+
+func TestNetworkClientFailsWhenNoVersionIsMutuallySupported(t *testing.T) {
+	// A modern-only server rejects every handshake version naming only
+	// 2026-07-28: the client must stop after one rejection and surface an
+	// actionable error instead of retrying every candidate.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	initCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		message := readHTTPRPCMessage(t, r)
+		if message.Method == "initialize" {
+			initCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			if _, err := w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":{"params":"Unsupported protocol version '2025-11-25'. Supported: 2026-07-28"}},"id":1}`)); err != nil {
+				t.Errorf("write rejection: %v", err)
+			}
+			return
+		}
+		writeHTTPRPCResponse(t, w, message.ID, map[string]any{})
+	}))
+	defer upstream.Close()
+
+	_, err := Connect(ctx, Server{Name: "modern", Type: ServerTypeHTTP, URL: upstream.URL})
+	if err == nil {
+		t.Fatal("Connect() error = nil, want unsupported-version failure")
+	}
+	if !strings.Contains(err.Error(), "no mutually supported protocol version") {
+		t.Fatalf("error = %v, want no mutually supported protocol version", err)
+	}
+	if !strings.Contains(err.Error(), "2026-07-28") {
+		t.Fatalf("error = %v, want the server's supported versions in the message", err)
+	}
+	if initCount != 1 {
+		t.Fatalf("initialize requests = %d, want 1 (no retry once the server names only unsupported versions)", initCount)
+	}
+}
+
 func TestNetworkClientRejectsServerInitiatedRequestAsResponse(t *testing.T) {
 	// A streamable-HTTP server that answers a tools/call POST with a
 	// method-bearing frame (a server-initiated request) must surface a protocol

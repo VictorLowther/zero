@@ -233,7 +233,10 @@ func connectStdio(ctx context.Context, server Server, options ConnectOptions) (*
 }
 
 // initialize performs the MCP handshake under a bounded timeout so a
-// non-responsive peer fails fast instead of hanging startup.
+// non-responsive peer fails fast instead of hanging startup. It negotiates the
+// protocol version: newer servers reject a stale proposal with an
+// "Unsupported protocol version" error listing what they speak, and the client
+// retries with a mutually supported candidate.
 func (client *Client) initialize(ctx context.Context) error {
 	initCtx, cancel := context.WithTimeout(ctx, initializeTimeout)
 	defer cancel()
@@ -241,17 +244,19 @@ func (client *Client) initialize(ctx context.Context) error {
 	var result struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
-	if err := client.request(initCtx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "zero",
-			"version": "dev",
+	_, err := initializeHandshake(
+		func(version string) (string, error) {
+			result.ProtocolVersion = ""
+			if err := client.request(initCtx, "initialize", initializeParams(version), &result); err != nil {
+				return "", err
+			}
+			return result.ProtocolVersion, nil
 		},
-	}, &result); err != nil {
-		return err
-	}
-	return client.notify("notifications/initialized", map[string]any{})
+		func(version string) error {
+			return client.notify("notifications/initialized", map[string]any{})
+		},
+	)
+	return err
 }
 
 func (client *Client) ListTools(ctx context.Context) ([]RemoteTool, error) {
@@ -380,7 +385,7 @@ func (client *Client) request(ctx context.Context, method string, params any, ta
 		}
 		message := result.message
 		if message.Error != nil {
-			return fmt.Errorf("MCP %s failed: %s", method, message.Error.Message)
+			return mcpErrorMessage(method, message.Error)
 		}
 		if target != nil && len(message.Result) > 0 {
 			if err := json.Unmarshal(message.Result, target); err != nil {

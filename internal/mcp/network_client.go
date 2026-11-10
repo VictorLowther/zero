@@ -17,11 +17,12 @@ import (
 )
 
 type networkClient struct {
-	server    Server
-	client    *http.Client
-	mu        sync.Mutex
-	nextID    int
-	sessionID string
+	server          Server
+	client          *http.Client
+	mu              sync.Mutex
+	nextID          int
+	sessionID       string
+	protocolVersion string
 }
 
 type remoteSSEClient struct {
@@ -94,34 +95,41 @@ func (client *networkClient) initialize(ctx context.Context) error {
 	var result struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
-	if err := client.request(ctx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "zero",
-			"version": "dev",
+	_, err := initializeHandshake(
+		func(proposed string) (string, error) {
+			result.ProtocolVersion = ""
+			if err := client.request(ctx, "initialize", initializeParams(proposed), &result); err != nil {
+				return "", err
+			}
+			return result.ProtocolVersion, nil
 		},
-	}, &result); err != nil {
-		return err
-	}
-	return client.notify(ctx, "notifications/initialized", map[string]any{})
+		func(negotiated string) error {
+			client.mu.Lock()
+			client.protocolVersion = negotiated
+			client.mu.Unlock()
+			return client.notify(ctx, "notifications/initialized", map[string]any{})
+		},
+	)
+	return err
 }
 
 func (client *remoteSSEClient) initialize(ctx context.Context) error {
 	var result struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
-	if err := client.request(ctx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "zero",
-			"version": "dev",
+	_, err := initializeHandshake(
+		func(proposed string) (string, error) {
+			result.ProtocolVersion = ""
+			if err := client.request(ctx, "initialize", initializeParams(proposed), &result); err != nil {
+				return "", err
+			}
+			return result.ProtocolVersion, nil
 		},
-	}, &result); err != nil {
-		return err
-	}
-	return client.notify(ctx, "notifications/initialized", map[string]any{})
+		func(negotiated string) error {
+			return client.notify(ctx, "notifications/initialized", map[string]any{})
+		},
+	)
+	return err
 }
 
 func (client *networkClient) ListTools(ctx context.Context) ([]RemoteTool, error) {
@@ -228,7 +236,7 @@ func (client *networkClient) request(ctx context.Context, method string, params 
 		return fmt.Errorf("MCP %s response id mismatch for server %s", method, client.server.Name)
 	}
 	if message.Error != nil {
-		return fmt.Errorf("MCP %s failed: %s", method, message.Error.Message)
+		return mcpErrorMessage(method, message.Error)
 	}
 	if target != nil && len(message.Result) > 0 {
 		if err := json.Unmarshal(message.Result, target); err != nil {
@@ -285,7 +293,7 @@ func (client *remoteSSEClient) request(ctx context.Context, method string, param
 			return fmt.Errorf("MCP %s response id mismatch for server %s", method, client.server.Name)
 		}
 		if message.Error != nil {
-			return fmt.Errorf("MCP %s failed: %s", method, message.Error.Message)
+			return mcpErrorMessage(method, message.Error)
 		}
 		if target != nil && len(message.Result) > 0 {
 			if err := json.Unmarshal(message.Result, target); err != nil {
@@ -456,6 +464,9 @@ func (client *networkClient) applyHeaders(request *http.Request) {
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	if client.sessionID != "" {
 		request.Header.Set("Mcp-Session-Id", client.sessionID)
+	}
+	if client.protocolVersion != "" {
+		request.Header.Set("MCP-Protocol-Version", client.protocolVersion)
 	}
 	applyAIMLAPIRequestHeaders(client.server, request)
 }

@@ -195,16 +195,22 @@ func TestAIMLAPIMCPHeadersOnlyForExactHost(t *testing.T) {
 		if err := client.initialize(context.Background()); err != nil {
 			t.Fatalf("%s: initialize: %v", rawURL, err)
 		}
-		for _, header := range recorder.recorded() {
+		for index, header := range recorder.recorded() {
 			if strings.Contains(rawURL, "user@") && strings.HasPrefix(header.Get("Authorization"), "Basic ") {
 				// net/http turns URL userinfo into Basic auth on its own.
 				header.Del("Authorization")
 			}
-			// Byte-for-byte what any other MCP server gets.
+			// Byte-for-byte what any other MCP server gets. The spec omits
+			// the version header on initialize itself and requires it once
+			// the version is negotiated (the fake server counters with
+			// 2024-11-05), so only later requests carry it.
 			want := http.Header{
 				"X-Custom":     {"kept"},
 				"Content-Type": {"application/json"},
 				"Accept":       {"application/json, text/event-stream"},
+			}
+			if index > 0 {
+				want["Mcp-Protocol-Version"] = []string{"2024-11-05"}
 			}
 			if fmt.Sprint(header) != fmt.Sprint(want) {
 				t.Fatalf("%s: headers = %v, want %v", rawURL, header, want)
